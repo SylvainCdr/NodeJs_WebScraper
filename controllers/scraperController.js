@@ -1,4 +1,18 @@
 const puppeteer = require("puppeteer");
+const admin = require("firebase-admin");
+const fs = require("fs");
+
+// Initialisation Firebase
+const serviceAccount = require("../firebase-key.json");
+admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    storageBucket: "webscraping-71cda.firebasestorage.app",
+});
+const db = admin.firestore();
+const bucket = admin.storage().bucket();
+
+// Fonction pour récupérer les sites via DuckDuckGo
+
 
 async function getCompanyWebsites(browser, searchQuery) {
     try {
@@ -8,26 +22,33 @@ async function getCompanyWebsites(browser, searchQuery) {
         await page.goto(`https://duckduckgo.com/?q=${encodeURIComponent(searchQuery)}&t=h_&ia=web`, { waitUntil: "domcontentloaded" });
         await new Promise(resolve => setTimeout(resolve, 3000));
 
-        let previousCount = 0;
         let links = [];
+        let previousCount = 0;
 
-        for (let i = 0; i < 5; i++) {
+        for (let i = 0; i < 7; i++) { // Augmenté à 7 pages
             let newLinks = await page.evaluate(() => {
                 return Array.from(document.querySelectorAll("a[data-testid='result-title-a']"))
                     .map(a => ({ name: a.textContent.trim(), url: a.href }))
                     .filter(result => result.url.startsWith("http") && !result.url.includes("duckduckgo.com"));
             });
 
-            if (newLinks.length > previousCount) {
-                links = newLinks;
-                previousCount = newLinks.length;
-            }
+            // Ajout des nouveaux liens sans écraser les précédents
+            newLinks.forEach(link => {
+                if (!links.some(existing => existing.url === link.url)) {
+                    links.push(link);
+                }
+            });
+
+            console.log(`📌 ${links.length} résultats collectés`);
+
+            if (links.length >= 200) break; // Stop si on a assez de résultats
 
             let moreResultsButton = await page.$("#more-results");
             if (moreResultsButton) {
                 await moreResultsButton.click();
                 await new Promise(resolve => setTimeout(resolve, 3000));
             } else {
+                console.log("✅ Plus de bouton 'Plus de résultats'. Fin du scraping.");
                 break;
             }
         }
@@ -40,77 +61,128 @@ async function getCompanyWebsites(browser, searchQuery) {
     }
 }
 
-async function scrapeWebsite(browser, site) {
-    if (!site || !site.url) {
-        console.error("❌ Erreur: site ou site.url est undefined dans scrapeWebsite");
-        return { email: "Non trouvé", phone: "Non trouvé", address: "Non trouvé" };
-    }
 
-    console.log('URL reçue par scrapeWebsite:', site.url);
-    if (!browser) return { email: "Non trouvé", phone: "Non trouvé", address: "Non trouvé" };
+// Scraping avec Puppeteer
+async function scrapeWithPuppeteer(url, browser) {
+    const page = await browser.newPage();
 
-    let retries = 3;
-    while (retries > 0) {
-        try {
-            const page = await browser.newPage();
-            await page.goto(site.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-            await new Promise(resolve => setTimeout(resolve, 3000));
-
-            let contactPageUrl = await page.evaluate(() => {
-                let contactLink = Array.from(document.querySelectorAll("a"))
-                    .find(a => /contact/i.test(a.innerText));
-                return contactLink ? contactLink.href : null;
-            });
-
-            if (contactPageUrl && !contactPageUrl.startsWith("mailto:")) {
-                try {
-                    await page.goto(contactPageUrl, { timeout: 60000, waitUntil: 'domcontentloaded' });
-                } catch (error) {
-                    console.error(`❌ Erreur scraping ${contactPageUrl}:`, error.message);
-                }
-                await new Promise(resolve => setTimeout(resolve, 3000));
-            }
-
-            let result = await page.evaluate(() => {
-                let email = document.body.innerText.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
-                let phone = document.body.innerText.match(/\+?\d{2,4}[ .-]?\d{2,4}[ .-]?\d{2,4}[ .-]?\d{2,4}/);
-                let address = document.body.innerText.match(/\d{1,4}\s+[^,]+,[^,]+,[^\d]+\d{2,5}/);
-                return {
-                    email: email ? email[0] : "Non trouvé",
-                    phone: phone ? phone[0] : "Non trouvé",
-                    address: address ? address[0] : "Non trouvé"
-                };
-            });
-
-            await page.close();
-            return result;
-        } catch (error) {
-            console.error(`❌ Erreur scraping ${site.url} (tentative restante: ${retries - 1}):`, error);
-            retries--;
+    // Désactiver images et CSS pour accélérer
+    await page.setRequestInterception(true);
+    page.on("request", (req) => {
+        if (["image", "stylesheet", "font"].includes(req.resourceType())) {
+            req.abort();
+        } else {
+            req.continue();
         }
-    }
+    });
 
-    return { email: "Non trouvé", phone: "Non trouvé", address: "Non trouvé" };
+    try {
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
+
+        // Extraction des emails & téléphones
+        const data = await page.evaluate(() => {
+            const bodyText = document.body.innerText;
+
+            const email = bodyText.match(/[\w.-]+@[a-zA-Z\d.-]+\.[a-zA-Z]{2,}/);
+            const phone = bodyText.match(/\+?\d{1,3}[\s.-]?\(?\d{2,4}\)?[\s.-]?\d{2,4}[\s.-]?\d{2,4}/);
+
+            return {
+                email: email ? email[0] : "Non trouvé",
+                phone: phone ? phone[0] : "Non trouvé",
+            };
+        });
+
+        // Capture d'écran
+        const screenshotPath = `screenshots/${new Date().getTime()}.png`;
+        await page.screenshot({ path: screenshotPath });
+
+        await page.close();
+        return { ...data, screenshotPath };
+    } catch (error) {
+        console.error(`❌ Puppeteer a échoué sur ${url} :`, error);
+        await page.close();
+        return null;
+    }
 }
 
-exports.scrape = async (req, res) => {
-    const browser = req.app.get("browser");
-    if (!browser) {
-        return res.status(500).json({ message: "Puppeteer n'est pas prêt. Réessayez plus tard." });
+// Upload de capture d’écran vers Firebase Storage
+async function uploadScreenshotToFirebase(localPath) {
+    try {
+        const file = bucket.file(localPath);
+        await file.save(fs.readFileSync(localPath), { metadata: { contentType: "image/png" } });
+        await file.makePublic();
+        fs.unlinkSync(localPath);
+        return file.publicUrl();
+    } catch (error) {
+        console.error(`❌ Erreur upload Firebase:`, error.message);
+        return null;
     }
+}
 
-    const { query = "Installateur vidéosurveillance Paris" } = req.query;
-    const websites = await getCompanyWebsites(browser, query);
-    console.log("🔎 Sites trouvés :", websites);
+// Fonction principale de scraping
+exports.scrape = async (req, res) => {
+    try {
+        console.log("🟢 Requête reçue pour le scraping !");
 
-    if (!websites.length) return res.json({ message: "Aucun site trouvé." });
+        const browser = req.app.get("browser");
+        if (!browser) {
+            console.error("❌ Puppeteer non disponible !");
+            return res.status(500).json({ error: "Puppeteer non disponible" });
+        }
 
-    const results = await Promise.all(
-        websites.map(async (site) => {
-            const data = await scrapeWebsite(browser, site);
-            return { website: site.url, name: site.name, ...data };
-        })
-    );
+        const { city = "Paris" } = req.query;
+        const query = `Installateur vidéosurveillance ${city}`;
+        console.log(`🔍 Recherche pour la ville : ${city}`);
 
-    res.json(results);
+        const websites = await getCompanyWebsites(browser, query);
+        console.log(`🌐 ${websites.length} sites trouvés`);
+
+        if (!websites.length) {
+            return res.json({ message: "Aucun site trouvé." });
+        }
+
+        const results = await Promise.all(
+            websites.map(async (site) => {
+                try {
+                    let data = await scrapeWithPuppeteer(site.url, browser);
+                    if (!data) return null;
+
+                    if (data.screenshotPath) {
+                        data.screenshotUrl = await uploadScreenshotToFirebase(data.screenshotPath);
+                    }
+
+                    // Vérifier si l'entreprise existe déjà dans Firestore
+                    const existingDocs = await db.collection("entreprises")
+                        .where("website", "==", site.url)
+                        .get();
+
+                    if (!existingDocs.empty) {
+                        console.log(`📌 Entreprise déjà en base: ${site.url}`);
+                        return null;
+                    }
+
+                    const docRef = await db.collection("entreprises").add({
+                        name: site.name,
+                        website: site.url,
+                        email: data.email || "Non trouvé",
+                        phone: data.phone || "Non trouvé",
+                        screenshotUrl: data.screenshotUrl || null,
+                        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                    });
+
+                    return { id: docRef.id, ...site, ...data };
+                } catch (err) {
+                    console.error(`⚠️ Erreur dans le traitement d'un site : ${err.message}`);
+                    return null;
+                }
+            })
+        );
+
+        console.log("✅ Scraping terminé !");
+        res.json(results.filter(result => result !== null));
+
+    } catch (error) {
+        console.error("❌ Erreur lors du scraping :", error.message);
+        res.status(500).json({ error: "Erreur lors du scraping" });
+    }
 };
