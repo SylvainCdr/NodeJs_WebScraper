@@ -2,6 +2,9 @@ const puppeteer = require("puppeteer");
 const admin = require("firebase-admin");
 const fs = require("fs");
 
+const axios = require("axios");
+const path = require("path");
+
 // Initialisation Firebase
 const serviceAccount = require("../firebase-key.json");
 admin.initializeApp({
@@ -62,6 +65,32 @@ async function getCompanyWebsites(browser, searchQuery) {
 }
 
 
+
+async function uploadLogoToFirebase(logoUrl, companyName) {
+    try {
+        if (!logoUrl || logoUrl === "Non trouvé") return null;
+
+        const response = await axios({
+            url: logoUrl,
+            responseType: "arraybuffer",
+        });
+
+        const fileExtension = path.extname(logoUrl.split("?")[0]); // Gérer les URLs avec des paramètres
+        const fileName = `logos/${companyName.replace(/\s+/g, "_")}${fileExtension}`;
+        const file = bucket.file(fileName);
+
+        await file.save(response.data, { metadata: { contentType: "image/png" } });
+        await file.makePublic();
+
+        return file.publicUrl();
+    } catch (error) {
+        console.error(`❌ Erreur upload logo Firebase:`, error.message);
+        return null;
+    }
+}
+
+
+
 // Scraping avec Puppeteer
 async function scrapeWithPuppeteer(url, browser) {
     const page = await browser.newPage();
@@ -69,7 +98,7 @@ async function scrapeWithPuppeteer(url, browser) {
     // Désactiver images et CSS pour accélérer
     await page.setRequestInterception(true);
     page.on("request", (req) => {
-        if (["image", "stylesheet", "font"].includes(req.resourceType())) {
+        if (["stylesheet", "font"].includes(req.resourceType())) {
             req.abort();
         } else {
             req.continue();
@@ -86,24 +115,30 @@ async function scrapeWithPuppeteer(url, browser) {
             const email = bodyText.match(/[\w.-]+@[a-zA-Z\d.-]+\.[a-zA-Z]{2,}/);
             const phone = bodyText.match(/\+?\d{1,3}[\s.-]?\(?\d{2,4}\)?[\s.-]?\d{2,4}[\s.-]?\d{2,4}/);
 
+            // Extraction du logo (on prend le premier logo trouvé)
+            let logo = null;
+            let logoElement = document.querySelector("img[id*='logo'], img[class*='logo'], img[src*='logo'], header img");
+
+            if (logoElement) {
+                logo = logoElement.src.startsWith("http") ? logoElement.src : window.location.origin + logoElement.src;
+            }
+
             return {
                 email: email ? email[0] : "Non trouvé",
                 phone: phone ? phone[0] : "Non trouvé",
+                logo
             };
         });
 
-        // Capture d'écran
-        const screenshotPath = `screenshots/${new Date().getTime()}.png`;
-        await page.screenshot({ path: screenshotPath });
-
         await page.close();
-        return { ...data, screenshotPath };
+        return data;
     } catch (error) {
         console.error(`❌ Puppeteer a échoué sur ${url} :`, error);
         await page.close();
         return null;
     }
 }
+
 
 // Upload de capture d’écran vers Firebase Storage
 async function uploadScreenshotToFirebase(localPath) {
@@ -146,30 +181,32 @@ exports.scrape = async (req, res) => {
                 try {
                     let data = await scrapeWithPuppeteer(site.url, browser);
                     if (!data) return null;
-
-                    if (data.screenshotPath) {
-                        data.screenshotUrl = await uploadScreenshotToFirebase(data.screenshotPath);
+        
+                    // Upload du logo
+                    let logoUrl = await uploadLogoToFirebase(data.logo, site.name);
+                    if (logoUrl) {
+                        data.logo = logoUrl; // Remplace l'URL d'origine par l'URL Firebase
                     }
-
+        
                     // Vérifier si l'entreprise existe déjà dans Firestore
                     const existingDocs = await db.collection("entreprises")
                         .where("website", "==", site.url)
                         .get();
-
+        
                     if (!existingDocs.empty) {
                         console.log(`📌 Entreprise déjà en base: ${site.url}`);
                         return null;
                     }
-
+        
                     const docRef = await db.collection("entreprises").add({
                         name: site.name,
                         website: site.url,
                         email: data.email || "Non trouvé",
                         phone: data.phone || "Non trouvé",
-                        screenshotUrl: data.screenshotUrl || null,
+                        logo: logoUrl || null, // Ajout du logo dans Firestore
                         createdAt: admin.firestore.FieldValue.serverTimestamp(),
                     });
-
+        
                     return { id: docRef.id, ...site, ...data };
                 } catch (err) {
                     console.error(`⚠️ Erreur dans le traitement d'un site : ${err.message}`);
@@ -177,6 +214,7 @@ exports.scrape = async (req, res) => {
                 }
             })
         );
+        
 
         console.log("✅ Scraping terminé !");
         res.json(results.filter(result => result !== null));
