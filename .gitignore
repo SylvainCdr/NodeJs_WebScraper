@@ -5,3 +5,6 @@
 # Ignore firebase configuration files
 firebase-key.json
 
+
+# le fichier : google_credentials.json
+google_credentials.json
